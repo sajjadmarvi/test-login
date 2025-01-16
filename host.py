@@ -551,6 +551,110 @@ SIGNUP_PAGE = '''
 </html>
 '''
 
+FORGOT_PASSWORD_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forgot Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #fafafa;
+            font-family: Arial, sans-serif;
+        }
+        .card {
+            border-radius: 8px;
+        }
+        h3 {
+            font-family: 'Billabong', cursive;
+            font-size: 2rem;
+            color: #262626;
+        }
+    </style>
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 350px;">
+            <h3 class="text-center mb-3">Forgot Password</h3>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+            <div class="alert alert-{{ messages[0][0] }} alert-dismissible fade show" role="alert">
+                {{ messages[0][1] }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+            {% endwith %}
+            <form action="/forgot_password" method="POST">
+                <div class="mb-3">
+                    <input type="text" name="username" class="form-control" placeholder="Enter your username" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Send OTP</button>
+            </form>
+            <p class="text-center mt-3"><a href="/">Back to Login</a></p>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+'''
+
+RESET_PASSWORD_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reset Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #fafafa;
+            font-family: Arial, sans-serif;
+        }
+        .card {
+            border-radius: 8px;
+        }
+        h3 {
+            font-family: 'Billabong', cursive;
+            font-size: 2rem;
+            color: #262626;
+        }
+    </style>
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 350px;">
+            <h3 class="text-center mb-3">Reset Password</h3>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+            <div class="alert alert-{{ messages[0][0] }} alert-dismissible fade show" role="alert">
+                {{ messages[0][1] }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+            {% endwith %}
+            <form action="/reset_password" method="POST">
+                <div class="mb-3">
+                    <input type="text" name="username" class="form-control" placeholder="Enter your username" required>
+                </div>
+                <div class="mb-3">
+                    <input type="text" name="otp" class="form-control" placeholder="Enter OTP" required>
+                </div>
+                <div class="mb-3">
+                    <input type="password" name="new_password" class="form-control" placeholder="Enter new password" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Reset Password</button>
+            </form>
+            <p class="text-center mt-3"><a href="/">Back to Login</a></p>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+'''
+
 SUCCESS_PAGE = '''
 <!DOCTYPE html>
 <html lang="en">
