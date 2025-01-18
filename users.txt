@@ -1,18 +1,22 @@
-Alireza_jf,Mrhjf5780,10
-abbaszade,javad1341,5
-hossein,123,3
-sajjadmarvi962701,smb25121381,9
-reza,razeghi,3
-sima,malek,8
-admin,AdMiN,10
-administrator,User@LoGin#tesT_-page,20
-alireza,mrhjf5780,3
-abbas,zadeh,3
-alirezajf,simba,3
-farhad,qwe,3
-ali,password,3
-hesam,shoombool,3
-vahid,duraton,3
-mahdi,airpods,3
-hossein,123,3
-morteza,shah,3
+{
+    "users": [
+        {
+            "username": "Alireza_jf",
+            "password": "$2b$12$2ZeSdxvQpvGjG9rwBEhc6eSHDv8fB/mv3Qy/cyzmMfZZsQsPW/hGq",
+            "role": "admin",
+            "max_attempts": 3
+        },
+        {
+            "username": "hossein",
+            "password": "$2b$12$nbaDJOKu9KB4IqaWvh/T0O/dSpNa9KHN32ftm4vHgbKQvV3Ki54PC",
+            "role": "user",
+            "max_attempts": 3
+        },
+        {
+            "username": "mohammadreza",
+            "password": "$2b$12$GtUJBj0278IS5kU8u4ktgOoTEIq7XXI62Vyic38qHQBo0otAmtLby",
+            "role": "user",
+            "max_attempts": 3
+        }
+    ]
+}
