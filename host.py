@@ -44,9 +44,9 @@ def make_celery(app):
 celery = make_celery(app)
 
 # Telegram Bot Token and ID
-TELEGRAM_BOT_TOKEN = 'your-bot-token'
-TELEGRAM_BOT_ID = '@your_id_bot'
-TELEGRAM_USER_ID = 1234567891  # Your Telegram User ID plese change this id
+TELEGRAM_BOT_TOKEN = '8000764348:AAEytputhjTO8Sp7QA939fUCm8ja6YQI23I'
+TELEGRAM_BOT_ID = '@Koshole_grooh_bot'
+TELEGRAM_USER_ID = 167514573  # Your Telegram User ID
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Helper functions
@@ -442,7 +442,14 @@ def mrhjf_search_logs():
     if os.path.exists('logs.json'):
         with open('logs.json', 'r', encoding='utf-8') as file:
             logs = json.load(file)
-    filtered_logs = [log for log in logs if query.lower() in log['username'].lower() or query.lower() in log['ip_address'].lower()]
+    
+    # Filter logs with None checks
+    filtered_logs = [
+        log for log in logs 
+        if (log.get('username') and query.lower() in log['username'].lower()) or 
+           (log.get('ip_address') and query.lower() in log['ip_address'].lower())
+    ]
+    
     return render_template_string(SEARCH_LOGS_PAGE, logs=filtered_logs, query=query)
 
 @app.route('/mrhjf/real_time_logs')
