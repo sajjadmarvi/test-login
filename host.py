@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, request, redirect, flash, session, jsonify
+from flask import Flask, render_template_string, request, redirect, flash, session, jsonify, url_for
 import os
 import json
 import bcrypt
@@ -9,8 +9,11 @@ from celery import Celery
 import boto3
 import logging
 from logging.handlers import RotatingFileHandler
-from config import Config, DevelopmentConfig, ProductionConfig  # وارد کردن کلاس‌های تنظیمات
-from datetime import datetime
+from config import Config, DevelopmentConfig, ProductionConfig
+from datetime import datetime, timedelta
+import telebot
+import threading
+import secrets
 
 app = Flask(__name__)
 app.config.from_object(DevelopmentConfig if os.environ.get('FLASK_ENV') == 'development' else ProductionConfig)
@@ -40,6 +43,11 @@ def make_celery(app):
 
 celery = make_celery(app)
 
+# Telegram Bot Token and ID
+TELEGRAM_BOT_TOKEN = 'your_bot_token'
+TELEGRAM_BOT_ID = '@id_user_bot'
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
 # Helper functions
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -66,12 +74,11 @@ def load_data():
             with open('data.json', 'r', encoding='utf-8') as f:
                 return json.load(f)
         except json.JSONDecodeError:
-            # اگر فایل خراب است، یک فایل جدید ایجاد کنید
             print("Corrupted data.json file. Creating a new one.")
-            default_data = {'users': []}
+            default_data = {'users': [], 'password_reset_tokens': {}}
             save_data(default_data)
             return default_data
-    return {'users': []}
+    return {'users': [], 'password_reset_tokens': {}}
 
 def save_data(data):
     with open('data.json', 'w', encoding='utf-8') as f:
@@ -84,6 +91,71 @@ def backup_data():
     with open(backup_filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
     return backup_filename
+
+# Log user actions
+def log_action(username, ip_address, action):
+    log_entry = {
+        'username': username,
+        'ip_address': ip_address,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'action': action
+    }
+    logs = []
+    if os.path.exists('logs.json'):
+        with open('logs.json', 'r', encoding='utf-8') as file:
+            logs = json.load(file)
+    logs.append(log_entry)
+    with open('logs.json', 'w', encoding='utf-8') as file:
+        json.dump(logs, file, indent=4)
+
+# Load and save chat messages
+def load_chat_messages():
+    if os.path.exists('chat_messages.json'):
+        try:
+            with open('chat_messages.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def save_chat_messages(messages):
+    with open('chat_messages.json', 'w', encoding='utf-8') as f:
+        json.dump(messages, f, indent=4)
+
+# Load and save password recovery requests
+def load_recovery_requests():
+    if os.path.exists('recovery_requests.json'):
+        try:
+            with open('recovery_requests.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def save_recovery_requests(requests):
+    with open('recovery_requests.json', 'w', encoding='utf-8') as f:
+        json.dump(requests, f, indent=4)
+
+# Generate a secure token for password reset
+def generate_password_reset_token(username):
+    token = secrets.token_urlsafe(32)
+    data = load_data()
+    data['password_reset_tokens'][token] = {
+        'username': username,
+        'expires': (datetime.now() + timedelta(hours=1)).isoformat()
+    }
+    save_data(data)
+    return token
+
+# Send password reset link via Telegram
+def send_password_reset_link(telegram_id, reset_link):
+    try:
+        message = f"برای بازیابی رمز عبور خود، روی لینک زیر کلیک کنید:\n{reset_link}\n\nاگر ربات را استارت نکرده‌اید، ابتدا ربات را از طریق لینک زیر استارت کنید:\nhttps://t.me/{TELEGRAM_BOT_ID}"
+        bot.send_message(telegram_id, message)
+        return True
+    except Exception as e:
+        app.logger.error(f"Error sending message via Telegram: {e}")
+        return False
 
 # Routes
 @app.route('/')
@@ -100,11 +172,13 @@ def do_login():
     if user and check_password(password, user['password']):
         session['username'] = user['username']
         session['role'] = user['role']
+        log_action(username, request.remote_addr, "Successful Login")
         flash('Login successful!', 'success')
         if user['role'] == 'admin':
             return redirect('/mrhjf')
-        return redirect('/success')
+        return redirect('/chat')
     else:
+        log_action(username, request.remote_addr, "Failed Login Attempt")
         flash('Invalid username or password', 'danger')
     return redirect('/')
 
@@ -114,6 +188,7 @@ def signup():
         username = request.form['username']
         password = request.form['password']
         confirm_password = request.form['confirm_password']
+        telegram_id = request.form['telegram_id']
         
         if password != confirm_password:
             flash('Passwords do not match!', 'danger')
@@ -128,15 +203,72 @@ def signup():
         new_user = {
             'username': username,
             'password': hash_password(password),
+            'telegram_id': telegram_id,
             'role': 'user',
             'max_attempts': 3
         }
         data['users'].append(new_user)
         save_data(data)  # ذخیره کاربر جدید در فایل JSON
         
+        log_action(username, request.remote_addr, "New User Signup")
         flash('Account created successfully! Please log in.', 'success')
         return redirect('/')
     return render_template_string(SIGNUP_PAGE)
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        username = request.form['username']
+        telegram_id = request.form['telegram_id']
+        data = load_data()
+        user = next((u for u in data['users'] if u['username'] == username and u['telegram_id'] == telegram_id), None)
+        if user:
+            # Generate a password reset token
+            token = generate_password_reset_token(username)
+            reset_link = url_for('reset_password', token=token, _external=True)
+            
+            # Send the reset link via Telegram
+            send_password_reset_link(telegram_id, reset_link)
+            
+            flash(f'A password reset link has been sent to your Telegram ID: {telegram_id}', 'success')
+        else:
+            flash('Invalid username or Telegram ID', 'danger')
+        return redirect('/forgot_password')
+    return render_template_string(FORGOT_PASSWORD_PAGE)
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    data = load_data()
+    token_data = data['password_reset_tokens'].get(token)
+    
+    if not token_data or datetime.fromisoformat(token_data['expires']) < datetime.now():
+        flash('Invalid or expired token', 'danger')
+        return redirect('/forgot_password')
+    
+    if request.method == 'POST':
+        new_password = request.form['new_password']
+        confirm_password = request.form['confirm_password']
+        
+        if new_password != confirm_password:
+            flash('Passwords do not match!', 'danger')
+            return redirect(url_for('reset_password', token=token))
+        
+        user = next((u for u in data['users'] if u['username'] == token_data['username']), None)
+        if user:
+            user['password'] = hash_password(new_password)
+            save_data(data)
+            del data['password_reset_tokens'][token]
+            save_data(data)
+            flash('Your password has been reset successfully!', 'success')
+            return redirect('/')
+    
+    return render_template_string(RESET_PASSWORD_PAGE, token=token)
+
+@app.route('/chat')
+def chat():
+    if 'username' not in session:
+        return redirect('/')
+    return render_template_string(CHAT_PAGE, username=session['username'])
 
 @app.route('/success')
 def success():
@@ -146,9 +278,11 @@ def success():
 
 @app.route('/logout')
 def logout():
+    log_action(session.get('username'), request.remote_addr, "Logout")
     session.clear()
     return redirect('/')
 
+# Admin Routes
 @app.route('/mrhjf')
 def mrhjf():
     if session.get('role') != 'admin':
@@ -174,7 +308,7 @@ def mrhjf_reports():
         with open('logs.json', 'r', encoding='utf-8') as file:
             logs = json.load(file)
     total_logins = len(logs)
-    failed_logins = len([log for log in logs if log['attempted_credentials'] != "Successful Login"])
+    failed_logins = len([log for log in logs if log['action'] != "Successful Login"])
     unique_ips = len(set(log['ip_address'] for log in logs))
     return render_template_string(REPORTS_PAGE, total_logins=total_logins, failed_logins=failed_logins, unique_ips=unique_ips)
 
@@ -202,6 +336,7 @@ def mrhjf_update_access():
         if max_attempts:
             user['max_attempts'] = int(max_attempts)  # تغییر تعداد تلاش‌ها
         save_data(data)
+        log_action(session.get('username'), request.remote_addr, f"Updated Access for {username}")
     return redirect('/mrhjf/access_control')
 
 @app.route('/mrhjf/search_logs')
@@ -221,6 +356,26 @@ def mrhjf_real_time_logs():
     if session.get('role') != 'admin':
         return redirect('/')
     return render_template_string(REAL_TIME_LOGS_PAGE)
+
+@app.route('/mrhjf/chat_logs')
+def mrhjf_chat_logs():
+    if session.get('role') != 'admin':
+        return redirect('/')
+    chat_messages = load_chat_messages()
+    return render_template_string(CHAT_LOGS_PAGE, chat_messages=chat_messages)
+
+@app.route('/mrhjf/real_time_chat')
+def mrhjf_real_time_chat():
+    if session.get('role') != 'admin':
+        return redirect('/')
+    return render_template_string(REAL_TIME_CHAT_PAGE)
+
+@app.route('/mrhjf/recovery_requests')
+def mrhjf_recovery_requests():
+    if session.get('role') != 'admin':
+        return redirect('/')
+    recovery_requests = load_recovery_requests()
+    return render_template_string(RECOVERY_REQUESTS_PAGE, recovery_requests=recovery_requests)
 
 @app.route('/mrhjf/view_decoded_passwords', methods=['POST'])
 def view_decoded_passwords():
@@ -245,13 +400,30 @@ def backup():
     if session.get('role') != 'admin':
         return redirect('/')
     backup_filename = backup_data()
+    log_action(session.get('username'), request.remote_addr, f"Backup created: {backup_filename}")
     flash(f'Backup created successfully: {backup_filename}', 'success')
     return redirect('/mrhjf')
 
-# WebSocket
-@socketio.on('connect')
-def handle_connect():
-    emit('log', {'data': 'Connected'})
+# WebSocket for chat
+@socketio.on('send_message')
+def handle_send_message(data):
+    username = session.get('username')
+    recipient = data.get('recipient')
+    message = data.get('message')
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if username and recipient and message:
+        chat_message = {
+            'sender': username,
+            'recipient': recipient,
+            'message': message,
+            'timestamp': timestamp
+        }
+        messages = load_chat_messages()
+        messages.append(chat_message)
+        save_chat_messages(messages)
+        
+        emit('receive_message', chat_message, broadcast=True)
 
 # HTML Templates
 LOGIN_PAGE = '''
@@ -294,6 +466,7 @@ LOGIN_PAGE = '''
                 <button type="submit" class="btn btn-primary w-100">Log In</button>
             </form>
             <p class="text-center mt-3">Don't have an account? <a href="/signup">Sign up</a></p>
+            <p class="text-center mt-3"><a href="/forgot_password">Forgot Password?</a></p>
         </div>
     </div>
     <script>
@@ -340,11 +513,190 @@ SIGNUP_PAGE = '''
                 <div class="mb-3">
                     <input type="password" name="confirm_password" class="form-control" placeholder="Confirm Password" required>
                 </div>
+                <div class="mb-3">
+                    <input type="text" name="telegram_id" class="form-control" placeholder="Telegram ID" required>
+                </div>
                 <button type="submit" class="btn btn-primary w-100">Sign Up</button>
             </form>
             <p class="text-center mt-3">Already have an account? <a href="/">Log in</a></p>
         </div>
     </div>
+</body>
+</html>
+'''
+
+FORGOT_PASSWORD_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forgot Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 350px;">
+            <h3 class="text-center mb-3">Forgot Password</h3>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            <form action="/forgot_password" method="POST">
+                <div class="mb-3">
+                    <input type="text" name="username" class="form-control" placeholder="Username" required>
+                </div>
+                <div class="mb-3">
+                    <input type="text" name="telegram_id" class="form-control" placeholder="Telegram ID" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Recover Password</button>
+            </form>
+            <p class="text-center mt-3">Contact the Telegram bot: <a href="https://t.me/{{ TELEGRAM_BOT_ID }}">{{ TELEGRAM_BOT_ID }}</a></p>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+RESET_PASSWORD_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reset Password</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 350px;">
+            <h3 class="text-center mb-3">Reset Password</h3>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            <form action="/reset_password/{{ token }}" method="POST">
+                <div class="mb-3">
+                    <input type="password" name="new_password" class="form-control" placeholder="New Password" required>
+                </div>
+                <div class="mb-3">
+                    <input type="password" name="confirm_password" class="form-control" placeholder="Confirm New Password" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Reset Password</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+CHAT_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #1e1e1e;
+            color: #ffffff;
+            font-family: 'Arial', sans-serif;
+        }
+        .chat-box {
+            height: 400px;
+            overflow-y: scroll;
+            border: 1px solid #444;
+            padding: 10px;
+            margin-bottom: 10px;
+            background-color: #2d2d2d;
+            border-radius: 5px;
+        }
+        .message {
+            padding: 8px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            background-color: #3a3a3a;
+        }
+        .message strong {
+            color: #4caf50;
+        }
+        .message em {
+            color: #888;
+            font-size: 0.9em;
+        }
+        .form-control {
+            background-color: #2d2d2d;
+            color: #ffffff;
+            border: 1px solid #444;
+        }
+        .form-control:focus {
+            background-color: #3a3a3a;
+            color: #ffffff;
+            border-color: #4caf50;
+        }
+        .btn-primary {
+            background-color: #4caf50;
+            border: none;
+        }
+        .btn-primary:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 800px; background-color: #2d2d2d;">
+            <h3 class="text-center mb-3">Chat</h3>
+            <div id="chat-box" class="chat-box">
+                <!-- Chat messages will appear here -->
+            </div>
+            <form id="chat-form">
+                <div class="mb-3">
+                    <input type="text" id="recipient" class="form-control" placeholder="Recipient (Username)" required>
+                </div>
+                <div class="mb-3">
+                    <textarea id="message" class="form-control" placeholder="Type your message here..." required></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Send</button>
+            </form>
+            <p class="text-center mt-3"><a href="/logout" class="btn btn-danger">Logout</a></p>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const chatBox = document.getElementById('chat-box');
+        const chatForm = document.getElementById('chat-form');
+
+        // Receive messages
+        socket.on('receive_message', function(data) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'message';
+            messageElement.innerHTML = `<strong>${data.sender}</strong> to <strong>${data.recipient}</strong>: ${data.message} <em>(${data.timestamp})</em>`;
+            chatBox.appendChild(messageElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        });
+
+        // Send messages
+        chatForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            const recipient = document.getElementById('recipient').value;
+            const message = document.getElementById('message').value;
+            if (recipient && message) {
+                socket.emit('send_message', { recipient, message });
+                document.getElementById('message').value = '';
+            }
+        });
+    </script>
 </body>
 </html>
 '''
@@ -388,6 +740,9 @@ ADMIN_PAGE = '''
             <a href="/mrhjf/access_control" class="btn btn-success mb-2">Access Control</a>
             <a href="/mrhjf/search_logs" class="btn btn-primary mb-2">Search Logs</a>
             <a href="/mrhjf/real_time_logs" class="btn btn-secondary mb-2">Real-Time Logs</a>
+            <a href="/mrhjf/chat_logs" class="btn btn-dark mb-2">View Chat Logs</a>
+            <a href="/mrhjf/real_time_chat" class="btn btn-light mb-2">Real-Time Chat</a>
+            <a href="/mrhjf/recovery_requests" class="btn btn-danger mb-2">View Recovery Requests</a>
             <form action="/mrhjf/backup" method="POST" style="display:inline;">
                 <button type="submit" class="btn btn-dark mb-2">Backup Data</button>
             </form>
@@ -417,6 +772,7 @@ LOGS_PAGE = '''
                         <th>Username</th>
                         <th>IP Address</th>
                         <th>Timestamp</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -425,6 +781,7 @@ LOGS_PAGE = '''
                         <td>{{ log.username }}</td>
                         <td>{{ log.ip_address }}</td>
                         <td>{{ log.timestamp }}</td>
+                        <td>{{ log.action }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -577,6 +934,7 @@ SEARCH_LOGS_PAGE = '''
                         <th>Username</th>
                         <th>IP Address</th>
                         <th>Timestamp</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -585,6 +943,7 @@ SEARCH_LOGS_PAGE = '''
                         <td>{{ log.username }}</td>
                         <td>{{ log.ip_address }}</td>
                         <td>{{ log.timestamp }}</td>
+                        <td>{{ log.action }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -622,10 +981,155 @@ REAL_TIME_LOGS_PAGE = '''
         eventSource.onmessage = function(event) {
             const log = JSON.parse(event.data);
             const logElement = document.createElement('div');
-            logElement.textContent = `${log.timestamp} - ${log.username} - ${log.ip_address}`;
+            logElement.textContent = `${log.timestamp} - ${log.username} - ${log.ip_address} - ${log.action}`;
             logsDiv.appendChild(logElement);
         };
     </script>
+</body>
+</html>
+'''
+
+CHAT_LOGS_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Logs</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 1200px;">
+            <h3 class="text-center mb-3">Chat Logs</h3>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Sender</th>
+                        <th>Recipient</th>
+                        <th>Message</th>
+                        <th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for message in chat_messages %}
+                    <tr>
+                        <td>{{ message.sender }}</td>
+                        <td>{{ message.recipient }}</td>
+                        <td>{{ message.message }}</td>
+                        <td>{{ message.timestamp }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <p class="text-center mt-3"><a href="/mrhjf" class="btn btn-secondary">Back to Admin Panel</a></p>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+REAL_TIME_CHAT_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #1e1e1e;
+            color: #ffffff;
+            font-family: 'Arial', sans-serif;
+        }
+        .chat-box {
+            height: 400px;
+            overflow-y: scroll;
+            border: 1px solid #444;
+            padding: 10px;
+            margin-bottom: 10px;
+            background-color: #2d2d2d;
+            border-radius: 5px;
+        }
+        .message {
+            padding: 8px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            background-color: #3a3a3a;
+        }
+        .message strong {
+            color: #4caf50;
+        }
+        .message em {
+            color: #888;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 1200px; background-color: #2d2d2d;">
+            <h3 class="text-center mb-3">Real-Time Chat</h3>
+            <div id="chat-box" class="chat-box">
+                <!-- Chat messages will appear here -->
+            </div>
+            <p class="text-center mt-3"><a href="/mrhjf" class="btn btn-secondary">Back to Admin Panel</a></p>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const chatBox = document.getElementById('chat-box');
+
+        // Receive messages
+        socket.on('receive_message', function(data) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'message';
+            messageElement.innerHTML = `<strong>${data.sender}</strong> to <strong>${data.recipient}</strong>: ${data.message} <em>(${data.timestamp})</em>`;
+            chatBox.appendChild(messageElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        });
+    </script>
+</body>
+</html>
+'''
+
+RECOVERY_REQUESTS_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recovery Requests</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 1200px;">
+            <h3 class="text-center mb-3">Recovery Requests</h3>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Username</th>
+                        <th>Telegram ID</th>
+                        <th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for request in recovery_requests %}
+                    <tr>
+                        <td>{{ request.username }}</td>
+                        <td>{{ request.telegram_id }}</td>
+                        <td>{{ request.timestamp }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <p class="text-center mt-3"><a href="/mrhjf" class="btn btn-secondary">Back to Admin Panel</a></p>
+        </div>
+    </div>
 </body>
 </html>
 '''
@@ -637,6 +1141,7 @@ if __name__ == '__main__':
         admin_user = {
             'username': 'Alireza_jf',
             'password': hash_password('mrhjf5780'),  # رمز عبور پیش‌فرض
+            'telegram_id': 'admin_telegram_id',  # آیدی تلگرام مدیر
             'role': 'admin',
             'max_attempts': 3
         }
