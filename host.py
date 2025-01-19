@@ -44,8 +44,9 @@ def make_celery(app):
 celery = make_celery(app)
 
 # Telegram Bot Token and ID
-TELEGRAM_BOT_TOKEN = 'your_bot_token'
-TELEGRAM_BOT_ID = '@id_user_bot'
+TELEGRAM_BOT_TOKEN = 'your-bot-token'
+TELEGRAM_BOT_ID = '@your_id_bot'
+TELEGRAM_USER_ID = 1234567891  # Your Telegram User ID plese change this id
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Helper functions
@@ -75,10 +76,10 @@ def load_data():
                 return json.load(f)
         except json.JSONDecodeError:
             print("Corrupted data.json file. Creating a new one.")
-            default_data = {'users': [], 'password_reset_tokens': {}}
+            default_data = {'users': [], 'password_reset_tokens': {}, 'recovery_requests': []}
             save_data(default_data)
             return default_data
-    return {'users': [], 'password_reset_tokens': {}}
+    return {'users': [], 'password_reset_tokens': {}, 'recovery_requests': []}
 
 def save_data(data):
     with open('data.json', 'w', encoding='utf-8') as f:
@@ -92,7 +93,7 @@ def backup_data():
         json.dump(data, f, indent=4)
     return backup_filename
 
-# Log user actions
+# Log user actions and send to Telegram
 def log_action(username, ip_address, action):
     log_entry = {
         'username': username,
@@ -107,6 +108,13 @@ def log_action(username, ip_address, action):
     logs.append(log_entry)
     with open('logs.json', 'w', encoding='utf-8') as file:
         json.dump(logs, file, indent=4)
+    
+    # Send log to Telegram
+    try:
+        message = f"📝 *New Log Entry*\n\n👤 *Username*: {username}\n🌐 *IP Address*: {ip_address}\n⏰ *Timestamp*: {log_entry['timestamp']}\n🔧 *Action*: {action}"
+        bot.send_message(TELEGRAM_USER_ID, message, parse_mode='Markdown')
+    except Exception as e:
+        app.logger.error(f"Error sending log to Telegram: {e}")
 
 # Load and save chat messages
 def load_chat_messages():
@@ -199,40 +207,76 @@ def signup():
             flash('Username already exists!', 'danger')
             return redirect('/signup')
         
-        # Create new user
-        new_user = {
+        # Generate a random code and send it to the user's Telegram ID
+        verification_code = secrets.token_hex(3)
+        try:
+            bot.send_message(telegram_id, f"Your verification code is: {verification_code}")
+        except Exception as e:
+            app.logger.error(f"Error sending verification code to Telegram: {e}")
+            flash('Error sending verification code. Please check your Telegram ID.', 'danger')
+            return redirect('/signup')
+        
+        # Store the verification code in the session
+        session['verification_code'] = verification_code
+        session['signup_data'] = {
             'username': username,
             'password': hash_password(password),
             'telegram_id': telegram_id,
             'role': 'user',
             'max_attempts': 3
         }
-        data['users'].append(new_user)
-        save_data(data)  # ذخیره کاربر جدید در فایل JSON
         
-        log_action(username, request.remote_addr, "New User Signup")
-        flash('Account created successfully! Please log in.', 'success')
-        return redirect('/')
+        return redirect('/verify_telegram')
     return render_template_string(SIGNUP_PAGE)
+
+@app.route('/signup_guide')
+def signup_guide():
+    return render_template_string(SIGNUP_GUIDE_PAGE)
+
+@app.route('/verify_telegram', methods=['GET', 'POST'])
+def verify_telegram():
+    if request.method == 'POST':
+        user_code = request.form['verification_code']
+        if 'verification_code' in session and user_code == session['verification_code']:
+            data = load_data()
+            data['users'].append(session['signup_data'])
+            save_data(data)
+            log_action(session['signup_data']['username'], request.remote_addr, "New User Signup")
+            flash('Account created successfully! Please log in.', 'success')
+            session.pop('verification_code', None)
+            session.pop('signup_data', None)
+            return redirect('/')
+        else:
+            flash('Invalid verification code', 'danger')
+    return render_template_string(VERIFY_TELEGRAM_PAGE)
 
 @app.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
     if request.method == 'POST':
         username = request.form['username']
-        telegram_id = request.form['telegram_id']
         data = load_data()
-        user = next((u for u in data['users'] if u['username'] == username and u['telegram_id'] == telegram_id), None)
+        user = next((u for u in data['users'] if u['username'] == username), None)
         if user:
             # Generate a password reset token
             token = generate_password_reset_token(username)
             reset_link = url_for('reset_password', token=token, _external=True)
             
             # Send the reset link via Telegram
-            send_password_reset_link(telegram_id, reset_link)
+            send_password_reset_link(user['telegram_id'], reset_link)
             
-            flash(f'A password reset link has been sent to your Telegram ID: {telegram_id}', 'success')
+            # Log the recovery request
+            recovery_request = {
+                'username': username,
+                'telegram_id': user['telegram_id'],
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            recovery_requests = load_recovery_requests()
+            recovery_requests.append(recovery_request)
+            save_recovery_requests(recovery_requests)
+            
+            flash(f'A password reset link has been sent to your Telegram ID: {user["telegram_id"]}', 'success')
         else:
-            flash('Invalid username or Telegram ID', 'danger')
+            flash('Invalid username', 'danger')
         return redirect('/forgot_password')
     return render_template_string(FORGOT_PASSWORD_PAGE)
 
@@ -337,6 +381,56 @@ def mrhjf_update_access():
             user['max_attempts'] = int(max_attempts)  # تغییر تعداد تلاش‌ها
         save_data(data)
         log_action(session.get('username'), request.remote_addr, f"Updated Access for {username}")
+    return redirect('/mrhjf/access_control')
+
+@app.route('/mrhjf/add_user', methods=['POST'])
+def add_user():
+    if session.get('role') != 'admin':
+        return redirect('/')
+    full_admin_password = request.form.get('full_admin_password')
+    if full_admin_password != 'alireza@9931':
+        flash('Invalid full admin password', 'danger')
+        return redirect('/mrhjf/access_control')
+    
+    username = request.form.get('username')
+    password = request.form.get('password')
+    telegram_id = request.form.get('telegram_id')
+    role = request.form.get('role')
+    max_attempts = request.form.get('max_attempts')
+    
+    data = load_data()
+    if any(u['username'] == username for u in data['users']):
+        flash('Username already exists!', 'danger')
+        return redirect('/mrhjf/access_control')
+    
+    new_user = {
+        'username': username,
+        'password': hash_password(password),
+        'telegram_id': telegram_id,
+        'role': role,
+        'max_attempts': int(max_attempts)
+    }
+    data['users'].append(new_user)
+    save_data(data)
+    log_action(session.get('username'), request.remote_addr, f"Added new user: {username}")
+    flash('User added successfully!', 'success')
+    return redirect('/mrhjf/access_control')
+
+@app.route('/mrhjf/delete_user', methods=['POST'])
+def delete_user():
+    if session.get('role') != 'admin':
+        return redirect('/')
+    full_admin_password = request.form.get('full_admin_password')
+    if full_admin_password != 'alireza@9931':
+        flash('Invalid full admin password', 'danger')
+        return redirect('/mrhjf/access_control')
+    
+    username = request.form.get('username')
+    data = load_data()
+    data['users'] = [u for u in data['users'] if u['username'] != username]
+    save_data(data)
+    log_action(session.get('username'), request.remote_addr, f"Deleted user: {username}")
+    flash('User deleted successfully!', 'success')
     return redirect('/mrhjf/access_control')
 
 @app.route('/mrhjf/search_logs')
@@ -516,9 +610,71 @@ SIGNUP_PAGE = '''
                 <div class="mb-3">
                     <input type="text" name="telegram_id" class="form-control" placeholder="Telegram ID" required>
                 </div>
+                <div class="mb-3">
+                    <a href="/signup_guide" class="btn btn-info w-100">How to get Telegram ID?</a>
+                </div>
                 <button type="submit" class="btn btn-primary w-100">Sign Up</button>
             </form>
             <p class="text-center mt-3">Already have an account? <a href="/">Log in</a></p>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+SIGNUP_GUIDE_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign Up Guide</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 800px;">
+            <h3 class="text-center mb-3">How to get your Telegram ID</h3>
+            <p>To get your Telegram ID, follow these steps:</p>
+            <ol>
+                <li>Open Telegram and search for the bot <a href="https://t.me/useninfobot">@useninfobot</a>.</li>
+                <li>Start the bot by clicking the "Start" button.</li>
+                <li>The bot will send you your Telegram ID. Make sure to copy it.</li>
+                <li>Return to the signup page and enter your Telegram ID in the "Telegram ID" field.</li>
+            </ol>
+            <p class="text-center mt-3"><a href="/signup" class="btn btn-secondary">Back to Sign Up</a></p>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+VERIFY_TELEGRAM_PAGE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verify Telegram</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container d-flex justify-content-center align-items-center min-vh-100">
+        <div class="card p-4 shadow-sm" style="width: 100%; max-width: 350px;">
+            <h3 class="text-center mb-3">Verify Telegram</h3>
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            <form action="/verify_telegram" method="POST">
+                <div class="mb-3">
+                    <input type="text" name="verification_code" class="form-control" placeholder="Verification Code" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Verify</button>
+            </form>
         </div>
     </div>
 </body>
@@ -549,12 +705,8 @@ FORGOT_PASSWORD_PAGE = '''
                 <div class="mb-3">
                     <input type="text" name="username" class="form-control" placeholder="Username" required>
                 </div>
-                <div class="mb-3">
-                    <input type="text" name="telegram_id" class="form-control" placeholder="Telegram ID" required>
-                </div>
                 <button type="submit" class="btn btn-primary w-100">Recover Password</button>
             </form>
-            <p class="text-center mt-3">Contact the Telegram bot: <a href="https://t.me/{{ TELEGRAM_BOT_ID }}">{{ TELEGRAM_BOT_ID }}</a></p>
         </div>
     </div>
 </body>
@@ -865,6 +1017,23 @@ ACCESS_CONTROL_PAGE = '''
             <form action="/mrhjf/view_decoded_passwords" method="POST" class="mt-3">
                 <input type="password" name="full_admin_password" class="form-control" placeholder="Enter Full Admin Password">
                 <button type="submit" class="btn btn-danger w-100 mt-2">View Decoded Passwords</button>
+            </form>
+            <form action="/mrhjf/add_user" method="POST" class="mt-3">
+                <input type="password" name="full_admin_password" class="form-control" placeholder="Enter Full Admin Password">
+                <input type="text" name="username" class="form-control" placeholder="Username">
+                <input type="password" name="password" class="form-control" placeholder="Password">
+                <input type="text" name="telegram_id" class="form-control" placeholder="Telegram ID">
+                <select name="role" class="form-select">
+                    <option value="user">User</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <input type="number" name="max_attempts" class="form-control" placeholder="Max Attempts">
+                <button type="submit" class="btn btn-success w-100 mt-2">Add User</button>
+            </form>
+            <form action="/mrhjf/delete_user" method="POST" class="mt-3">
+                <input type="password" name="full_admin_password" class="form-control" placeholder="Enter Full Admin Password">
+                <input type="text" name="username" class="form-control" placeholder="Username">
+                <button type="submit" class="btn btn-danger w-100 mt-2">Delete User</button>
             </form>
             <p class="text-center mt-3"><a href="/mrhjf" class="btn btn-secondary">Back to Admin Panel</a></p>
         </div>
